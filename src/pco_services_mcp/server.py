@@ -16,6 +16,7 @@ from mcp_types import ToolAnnotations
 from pco_services_mcp import __version__, credentials, downloads
 from pco_services_mcp.blockouts import MonthlyBy, Repeat, build_attributes, resolve_zone
 from pco_services_mcp.client import (
+    PEOPLE,
     SERVICES,
     Document,
     MorePagesError,
@@ -32,9 +33,10 @@ _STILL_CURRENT = timedelta(hours=12)
 
 INSTRUCTIONS = """\
 Planning Center Services for the signed-in volunteer only. Start with my_schedule: it gives
-the service_type_id and plan_id the other plan tools need. plan_team, service_order and the
-attachment tools only work for plans on the user's own schedule. Blockout dates given as
-YYYY-MM-DD cover the whole day in the church's time zone."""
+the service_type_id and plan_id the other plan tools need. plan_team, team_contacts,
+service_order and the attachment tools only work for plans on the user's own schedule.
+contact_info finds someone by name among the people on the user's upcoming plans. Blockout
+dates given as YYYY-MM-DD cover the whole day in the church's time zone."""
 
 
 def _client() -> PcoClient:
@@ -115,7 +117,7 @@ async def _my_plan(service_type_id: str, plan_id: str) -> str:
     try:
         mine = await state.api().get(f"{path}/my_schedules")
     except PcoError as exc:
-        if "returned 404" in str(exc):
+        if exc.status == 404:
             raise refusal from None
         raise
     if not mine.get("data"):
@@ -138,6 +140,12 @@ async def my_schedule(limit: int = 10) -> dict:
 
     Returns service_type_id and plan_id for plan_team, service_order and attachments.
     """
+    found, incomplete = await _upcoming(limit)
+    return {"schedules": found, "incomplete": incomplete}
+
+
+async def _upcoming(limit: int) -> tuple[list[dict], bool]:
+    """Your next `limit` schedule entries, and whether the search stopped early."""
     api = state.api()
     me = await api.me_id()
     cutoff = datetime.now(timezone.utc) - _STILL_CURRENT
@@ -167,7 +175,11 @@ async def my_schedule(limit: int = 10) -> dict:
     except MorePagesError:
         incomplete = True
     found.sort(key=lambda s: s["sort_date"] or "")
-    return {"schedules": found[:limit], "incomplete": incomplete}
+    return found[:limit], incomplete
+
+
+def _team_name(doc: Document, member: dict) -> str:
+    return ((doc.related(member, "team") or {}).get("attributes") or {}).get("name") or "Other"
 
 
 @mcp.tool(annotations=READ)
@@ -178,8 +190,7 @@ async def plan_team(service_type_id: str, plan_id: str) -> dict:
     teams: dict[str, list[dict]] = defaultdict(list)
     for member in doc.data:
         attrs = member["attributes"]
-        team = doc.related(member, "team")
-        teams[(team or {}).get("attributes", {}).get("name") or "Other"].append(
+        teams[_team_name(doc, member)].append(
             {
                 "name": attrs.get("name"),
                 "position": attrs.get("team_position_name"),
@@ -187,6 +198,129 @@ async def plan_team(service_type_id: str, plan_id: str) -> dict:
             }
         )
     return {"teams": dict(teams), "truncated": doc.incomplete}
+
+
+# ── Contacts ────────────────────────────────────────────
+
+# Planning Center's answer when you may not see someone's details: 404 from Services, 403 from
+# People. Shown as "not visible", never worked around.
+_HIDDEN = (403, 404)
+_PARALLEL_LOOKUPS = 4
+_MAX_MATCHES = 5
+_SEARCH_SCHEDULES = 10
+
+
+def _add_people(people: dict[str, dict], doc: Document, me: str) -> None:
+    """Merge a plan's team members into `people`: person id → name and teams."""
+    for member in doc.data:
+        pid = related_id(member, "person")
+        if not pid or pid == me:
+            continue
+        entry = people.setdefault(
+            check_id(pid, "person id"), {"name": member["attributes"].get("name"), "teams": []}
+        )
+        if (team := _team_name(doc, member)) not in entry["teams"]:
+            entry["teams"].append(team)
+
+
+async def _visible(path: str, pick: Callable[[dict], dict]) -> list[dict] | None:
+    """The records at `path`, or None when Planning Center won't show them to you."""
+    try:
+        doc = await state.api().get_all(path)
+    except PcoError as exc:
+        if exc.status in _HIDDEN:
+            return None
+        raise
+    if doc.incomplete:
+        raise PcoError("A contact list is too long to read in full.")
+    return [pick(r.get("attributes") or {}) for r in doc.data]
+
+
+def _email(a: dict) -> dict:
+    return {"address": a.get("address"), "primary": bool(a.get("primary"))}
+
+
+def _phone(a: dict) -> dict:
+    return {
+        "number": a.get("number"),
+        "location": a.get("location"),
+        "primary": bool(a.get("primary")),
+    }
+
+
+async def _contacts(people: dict[str, dict]) -> list[dict]:
+    """Each person with `emails` and `phones`; either is None where it isn't visible to you."""
+    gate = asyncio.Semaphore(_PARALLEL_LOOKUPS)
+
+    async def one(pid: str, person: dict) -> dict:
+        async with gate:
+            emails = await _visible(f"{SERVICES}/people/{pid}/emails", _email)
+            phones = await _visible(f"{PEOPLE}/people/{pid}/phone_numbers", _phone)
+        return {**person, "emails": emails, "phones": phones}
+
+    found = await asyncio.gather(*(one(pid, p) for pid, p in people.items()))
+    return sorted(found, key=lambda p: (p["name"] or "").lower())
+
+
+@mcp.tool(annotations=READ)
+async def team_contacts(service_type_id: str, plan_id: str) -> dict:
+    """Email addresses and phone numbers for the people on one of your plans.
+
+    emails or phones is null where Planning Center doesn't let you see that person's details.
+    """
+    path = await _my_plan(service_type_id, plan_id)
+    api = state.api()
+    doc = await api.get_all(f"{path}/team_members", include="team")
+    people: dict[str, dict] = {}
+    _add_people(people, doc, await api.me_id())
+    return {"people": await _contacts(people), "truncated": doc.incomplete}
+
+
+@mcp.tool(annotations=READ)
+async def contact_info(name: str) -> dict:
+    """Email and phone for someone on your upcoming plans, found by any part of their name.
+
+    Searches the people scheduled on the plans of your next 10 schedule entries. emails or
+    phones is null where Planning Center doesn't let you see that person's details.
+    """
+    words = name.lower().split()
+    if not words:
+        raise PcoError("Give at least part of the person's name.")
+    api = state.api()
+    me = await api.me_id()
+    schedules, incomplete = await _upcoming(_SEARCH_SCHEDULES)
+    plans = dict.fromkeys(
+        (s["service_type_id"], s["plan_id"])
+        for s in schedules
+        if s["service_type_id"] and s["plan_id"]
+    )
+    people: dict[str, dict] = {}
+    not_visible = 0
+    for st, plan in plans:
+        try:
+            doc = await api.get_all(f"{_plan_path(st, plan)}/team_members", include="team")
+        except PcoError as exc:
+            if exc.status in _HIDDEN:
+                not_visible += 1
+                continue
+            raise
+        incomplete = incomplete or doc.incomplete
+        _add_people(people, doc, me)
+    matches = {
+        pid: p for pid, p in people.items() if all(w in (p["name"] or "").lower() for w in words)
+    }
+    if len(matches) > _MAX_MATCHES:
+        return {
+            "too_many_matches": sorted(p["name"] or "" for p in matches.values()),
+            "hint": "Give more of the name.",
+        }
+    return {
+        "matches": await _contacts(matches),
+        "plans_searched": len(plans) - not_visible,
+        # Plans on your schedule whose team list Planning Center won't show you.
+        "plans_not_visible": not_visible,
+        "incomplete": incomplete or bool(not_visible),
+    }
 
 
 # ── Service order and attachments ───────────────────────

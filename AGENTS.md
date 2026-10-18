@@ -16,13 +16,17 @@ SDK's `MCPServer`, `httpx`. See README.md for the tool list and setup.
 
 ## Code rules
 
-- Every authenticated request goes through `PcoClient.request`, which enforces the Services-API
-  allowlist in `client.api_url`. Never add a second authenticated client or bypass it.
+- Every authenticated request goes through `PcoClient.request`, which enforces the allowlist in
+  `client.api_url`: the Services API plus People's `people/<id>/phone_numbers`, nothing else.
+  Never add a second authenticated client or bypass it, and widen the allowlist only for a
+  specific endpoint, with a test that refuses its neighbours.
 - Ids from tool arguments go through `check_id`. Filesystem paths are built only by
   `downloads.confined`; tools never accept a path from the model.
 - Errors the model should see are `PcoError` (a `ToolError`); plain exceptions reach the client
   as an opaque failure.
 - Plan-scoped tools call `_my_plan` first, so they only work for plans on the user's schedule.
+- Contact details are shown only where Planning Center returns them; a 403/404 means "not
+  visible to you" and is reported as such, never worked around.
 - Each security guard has a test that fails if the guard is removed. Keep it that way.
 
 ## Checks

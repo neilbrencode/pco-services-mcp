@@ -3,8 +3,10 @@
 Two trust boundaries live here:
 
 - The Basic-auth client only ever talks to the Planning Center API origin, on
-  an allowlisted path. Every URL, including `links.next` and `links.self` from
-  a response, is checked before the request is built.
+  an allowlisted path: the Services API, plus one People endpoint (a person's
+  phone numbers, which Services doesn't have). Every URL, including
+  `links.next` and `links.self` from a response, is checked before the request
+  is built.
 - Attachment files come from pre-signed storage URLs. They are fetched by a
   second client that carries no credentials, only from allowlisted storage
   hosts, with each redirect hop re-checked.
@@ -31,6 +33,9 @@ from pco_services_mcp.credentials import Credentials
 API_HOST = "api.planningcenteronline.com"
 API_ROOT = f"https://{API_HOST}"
 SERVICES = "/services/v2"
+PEOPLE = "/people/v2"
+# The only People endpoint the token may reach.
+_PEOPLE_PHONES = re.compile(r"/people/v2/people/\d{1,20}/phone_numbers")
 USER_AGENT = f"pco-services-mcp/{__version__}"
 MAX_ATTEMPTS = 3
 MAX_REDIRECTS = 3
@@ -49,6 +54,10 @@ for _name in ("httpx", "httpcore"):
 
 class PcoError(ToolError):
     """An anticipated failure; its text reaches the MCP client as-is."""
+
+    def __init__(self, message: str, *, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 def check_id(value: str, what: str = "id") -> str:
@@ -70,9 +79,11 @@ def api_url(path_or_url: str) -> str:
         or parts.username
         or parts.password
         or posixpath.normpath(path) != path.rstrip("/")
-        or not (path == SERVICES or path.startswith(SERVICES + "/"))
+        or not (
+            path == SERVICES or path.startswith(SERVICES + "/") or _PEOPLE_PHONES.fullmatch(path)
+        )
     ):
-        raise PcoError("Refused a request outside the Planning Center Services API.")
+        raise PcoError("Refused a request outside the allowed Planning Center API paths.")
     return url
 
 
@@ -158,7 +169,7 @@ class PcoClient:
                 break
             await asyncio.sleep(min(float(resp.headers.get("Retry-After", "2")), 30.0))
         if resp.status_code >= 400:
-            raise PcoError(_describe(resp))
+            raise PcoError(_describe(resp), status=resp.status_code)
         if resp.status_code == 204 or not resp.content:
             return None
         return resp.json()

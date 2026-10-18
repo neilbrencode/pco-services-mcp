@@ -14,6 +14,8 @@ Planning Center and nothing more.
 |---|---|
 | `my_schedule` | When you're next serving: date, service, team, position, and whether you've accepted |
 | `plan_team` | Who else is scheduled on that plan, grouped by team |
+| `team_contacts` | Email addresses and phone numbers for the people on that plan |
+| `contact_info` | Someone's email and phone, found by name among the people on your upcoming plans |
 | `service_order` | The order of service: songs, keys, arrangements, lengths |
 | `list_attachments` | Charts, lead sheets and audio attached to the plan's songs |
 | `download_attachments` | Saves those files to your download folder (PDFs only with `file_types: ["pdf"]`) |
@@ -22,8 +24,10 @@ Planning Center and nothing more.
 | `remove_blockout` | Delete a blockout (a repeating one is deleted as a whole series) |
 | `skip_blockout_date` | Make yourself available on one date of a repeating blockout |
 
-The plan tools only work for plans **you're scheduled on**. People on a plan are shown by name,
-team, position and status only.
+The plan tools only work for plans **you're scheduled on**. `plan_team` shows people by name,
+team, position and status only. The two contact tools show email addresses and phone numbers,
+and only where Planning Center already lets you see them (usually the people on your own
+teams); for anyone else they say the details aren't visible, rather than working around it.
 
 ## Set up
 
@@ -73,8 +77,9 @@ Add to `claude_desktop_config.json` (on Windows, use the full path to `uv.exe`):
 
 ## How it keeps your data and token safe
 
-- The token is only ever sent to `https://api.planningcenteronline.com/services/v2/…`. Every
-  URL, including paging links in Planning Center's own responses, is checked first.
+- The token is only ever sent to `https://api.planningcenteronline.com/services/v2/…`, plus
+  one People endpoint, `/people/v2/people/<id>/phone_numbers` (Services has no phone numbers).
+  Every URL, including paging links in Planning Center's own responses, is checked first.
 - Files are fetched from Planning Center's storage host by a separate client that carries no
   credentials. Download links never appear in errors or logs.
 - Downloads only go under the download folder; file names come from Planning Center and are
