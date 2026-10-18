@@ -100,7 +100,8 @@ async def test_my_schedule_reports_an_unfinished_traversal(fake):
 
 
 @pytest.mark.parametrize(
-    "tool", ["plan_team", "service_order", "list_attachments", "download_attachments"]
+    "tool",
+    ["plan_team", "team_contacts", "service_order", "list_attachments", "download_attachments"],
 )
 @pytest.mark.parametrize("reply", ["empty", "404"])
 async def test_plan_tools_refuse_plans_not_on_my_schedule(fake, tool, reply):
@@ -119,35 +120,187 @@ async def test_plan_ids_must_be_numeric(fake):
     assert fake.requests == []
 
 
-async def test_plan_team_groups_by_team(fake):
-    on_my_schedule(fake)
-    member = lambda pid, team, name: {  # noqa: E731
+def member(mid: str, team: str, name: str, person: str | None = None) -> dict:
+    relationships = {"team": {"data": {"type": "Team", "id": team}}}
+    if person:
+        relationships["person"] = {"data": {"type": "Person", "id": person}}
+    return {
         "type": "PlanPerson",
-        "id": pid,
+        "id": mid,
         "attributes": {
             "name": name,
             "team_position_name": "Vocals",
             "status": "U",
             "notes": "private",
         },
-        "relationships": {"team": {"data": {"type": "Team", "id": team}}},
+        "relationships": relationships,
     }
+
+
+def team_members_route(fake, *members, plan: str = PLAN):
     fake.route(
         "GET",
-        f"{PLAN}/team_members",
+        f"{plan}/team_members",
         jsonapi(
-            [member("1", "t1", "Alex Example"), member("2", "t2", "Sam Sample")],
+            list(members),
             included=[
                 {"type": "Team", "id": "t1", "attributes": {"name": "Band"}},
                 {"type": "Team", "id": "t2", "attributes": {"name": "Tech"}},
             ],
         ),
     )
+
+
+async def test_plan_team_groups_by_team(fake):
+    on_my_schedule(fake)
+    team_members_route(fake, member("1", "t1", "Alex Example"), member("2", "t2", "Sam Sample"))
     _, out = await call("plan_team", ARGS)
     assert out["teams"] == {
         "Band": [{"name": "Alex Example", "position": "Vocals", "status": "unconfirmed"}],
         "Tech": [{"name": "Sam Sample", "position": "Vocals", "status": "unconfirmed"}],
     }
+
+
+def contact_routes(fake):
+    """2001 lets you see their details, 2002 doesn't; 1001 is you."""
+    fake.route(
+        "GET",
+        "/services/v2/people/2001/emails",
+        jsonapi(
+            [
+                {
+                    "type": "Email",
+                    "id": "e1",
+                    "attributes": {
+                        "address": "alex@example.com",
+                        "primary": True,
+                        "location": "Home",
+                    },
+                }
+            ]
+        ),
+    )
+    fake.route(
+        "GET",
+        "/people/v2/people/2001/phone_numbers",
+        jsonapi(
+            [
+                {
+                    "type": "PhoneNumber",
+                    "id": "p1",
+                    "attributes": {
+                        "number": "555-0100",
+                        "location": "Mobile",
+                        "primary": True,
+                        "carrier": "x",
+                    },
+                }
+            ]
+        ),
+    )
+    fake.route("GET", "/services/v2/people/2002/emails", error(404))
+    fake.route("GET", "/people/v2/people/2002/phone_numbers", error(403))
+
+
+ALEX = {
+    "name": "Alex Example",
+    "teams": ["Band", "Tech"],
+    "emails": [{"address": "alex@example.com", "primary": True}],
+    "phones": [{"number": "555-0100", "location": "Mobile", "primary": True}],
+}
+SAM = {"name": "Sam Sample", "teams": ["Tech"], "emails": None, "phones": None}
+
+
+async def test_team_contacts_shows_what_planning_center_allows(fake):
+    on_my_schedule(fake)
+    team_members_route(
+        fake,
+        member("m1", "t1", "Alex Example", "2001"),
+        member("m2", "t2", "Alex Example", "2001"),
+        member("m3", "t2", "Sam Sample", "2002"),
+        member("m4", "t1", "Me Myself", ME),
+    )
+    contact_routes(fake)
+    _, out = await call("team_contacts", ARGS)
+    assert out == {"people": [ALEX, SAM], "truncated": False}
+    assert not any(f"/people/{ME}/" in p for p in fake.paths())
+
+
+async def test_a_contact_lookup_failure_is_not_shown_as_hidden(fake):
+    on_my_schedule(fake)
+    team_members_route(fake, member("m1", "t1", "Alex Example", "2001"))
+    contact_routes(fake)
+    fake.route("GET", "/people/v2/people/2001/phone_numbers", error(500))
+    is_error, text = await call("team_contacts", ARGS)
+    assert is_error and "500" in text
+
+
+async def test_contact_info_searches_my_upcoming_plans_by_name(fake):
+    other = "/services/v2/service_types/20/plans/301"
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi(
+            [
+                schedule("1", "2099-01-01T17:00:00Z"),
+                schedule("2", "2099-01-01T17:00:00Z"),
+                schedule("3", "2099-01-08T17:00:00Z", plan="301"),
+            ]
+        ),
+    )
+    team_members_route(fake, member("m1", "t1", "Alex Example", "2001"))
+    team_members_route(
+        fake,
+        member("m2", "t2", "Alex Example", "2001"),
+        member("m3", "t2", "Sam Sample", "2002"),
+        plan=other,
+    )
+    contact_routes(fake)
+    _, out = await call("contact_info", {"name": "  example ALEX "})
+    assert out == {
+        "matches": [ALEX],
+        "plans_searched": 2,
+        "plans_not_visible": 0,
+        "incomplete": False,
+    }
+    assert not any("/people/2002/" in p for p in fake.paths())
+    _, out = await call("contact_info", {"name": "Sam"})
+    assert out["matches"] == [SAM]
+
+    # A plan whose team list you can't see makes the search incomplete, not silently empty.
+    fake.route("GET", f"{other}/team_members", error(403))
+    _, out = await call("contact_info", {"name": "Sam"})
+    assert out == {"matches": [], "plans_searched": 1, "plans_not_visible": 1, "incomplete": True}
+
+
+async def test_a_contact_list_cut_short_is_refused(fake):
+    on_my_schedule(fake)
+    team_members_route(fake, member("m1", "t1", "Alex Example", "2001"))
+    contact_routes(fake)
+    more = "https://api.planningcenteronline.com/services/v2/people/2001/emails?offset=1"
+    fake.route("GET", "/services/v2/people/2001/emails", jsonapi([], next_url=more))
+    is_error, text = await call("team_contacts", ARGS)
+    assert is_error and "too long" in text
+
+
+async def test_contact_info_asks_for_more_of_a_common_name(fake):
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi([schedule("1", "2099-01-01T17:00:00Z")]),
+    )
+    team_members_route(
+        fake, *(member(f"m{i}", "t1", f"Pat Example {i}", str(3000 + i)) for i in range(6))
+    )
+    _, out = await call("contact_info", {"name": "pat"})
+    assert len(out["too_many_matches"]) == 6
+    assert not any(p.endswith(("/emails", "/phone_numbers")) for p in fake.paths())
+
+
+async def test_contact_info_needs_a_name(fake):
+    is_error, text = await call("contact_info", {"name": "   "})
+    assert is_error and "part of the person's name" in text
+    assert fake.requests == []
 
 
 def items_route(fake):

@@ -24,6 +24,17 @@ def test_api_url_allows_services(url):
 @pytest.mark.parametrize(
     "url",
     [
+        "/people/v2/people/1001/phone_numbers",
+        "https://api.planningcenteronline.com/people/v2/people/1001/phone_numbers?offset=25",
+    ],
+)
+def test_api_url_allows_only_phone_numbers_from_people(url):
+    assert "/people/v2/people/1001/phone_numbers" in api_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "https://evil.example/services/v2/me",
         "http://api.planningcenteronline.com/services/v2/me",
         "https://user@api.planningcenteronline.com/services/v2/me",
@@ -31,6 +42,16 @@ def test_api_url_allows_services(url):
         "https://api.planningcenteronline.com.evil.example/services/v2/me",
         "/services/v2/../people/v2/people",
         "/people/v2/me",
+        "/people/v2",
+        "/people/v2/people",
+        "/people/v2/people/1001",
+        "/people/v2/people/1001/addresses",
+        "/people/v2/people/1001/emails",
+        "/people/v2/people/1001/phone_numbers/5",
+        "/people/v2/people/abc/phone_numbers",
+        "/people/v2/people/1001/phone_numbers/../addresses",
+        "/people/v2/people/1001/phone_numbers/",
+        "/services/v2/../people/v2/people/1001/addresses",
         "/giving/v2/donations",
         "//evil.example/services/v2/me",
     ],
