@@ -348,6 +348,32 @@ async def test_concurrent_downloads_of_one_plan_keep_both_files(fake, tmp_path, 
     assert set(manifest) == {"50", "53"}
 
 
+async def test_one_failed_download_does_not_stop_or_pollute_the_rest(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("PCO_DOWNLOAD_DIR", str(tmp_path))
+    on_my_schedule(fake)
+    items_route(fake)
+    plan_and_service_type_routes(fake)
+    attachments_route(
+        fake,
+        attachment("50", "Key", "k1"),
+        attachment("53", "Song", "s1", filename="Lead.pdf"),
+        attachment("54", "Song", "s1", filename="Vocal.pdf"),
+    )
+    fake.route("POST", f"{PLAN}/all_attachments/50/open", error(500))
+    for aid in ("53", "54"):
+        open_route(fake, aid)
+    fake.route("GET", "/b/53", httpx.Response(200, content=b"%PDF-53"))
+    fake.route("GET", "/b/54", httpx.Response(403))
+
+    _, out = await call("download_attachments", ARGS)
+    assert out["saved"] == ["Lead.pdf"]
+    assert [f["id"] for f in out["failed"]] == ["50", "54"]
+    folder = tmp_path / "2099-01-01 Sunday AM"
+    assert sorted(p.name for p in folder.iterdir()) == [".pco-attachments.json", "Lead.pdf"]
+    manifest = json.loads((folder / ".pco-attachments.json").read_text(encoding="utf-8"))
+    assert set(manifest) == {"53"}
+
+
 async def test_errors_reach_the_client_with_their_text(fake):
     fake.route("GET", "/services/v2/me", error(401, "token revoked"))
     is_error, text = await call("list_blockouts")
