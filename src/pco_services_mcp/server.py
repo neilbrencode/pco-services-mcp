@@ -30,6 +30,8 @@ ENV_TIME_ZONE = "PCO_TIME_ZONE"
 _STATUS = {"C": "confirmed", "U": "unconfirmed", "D": "declined"}
 # A service that started a few hours ago is still "today's" service.
 _STILL_CURRENT = timedelta(hours=12)
+# Schedule entries without a date sort after the dated ones.
+_UNDATED = datetime.max.replace(tzinfo=timezone.utc)
 
 INSTRUCTIONS = """\
 Planning Center Services for the signed-in volunteer only. Start with my_schedule: it gives
@@ -104,6 +106,12 @@ def _local(value: str | None, zone) -> str | None:
     return moment.astimezone(zone).strftime("%Y-%m-%d %H:%M") if moment else None
 
 
+def _wall_clock(value: str | None, zone) -> datetime | None:
+    """A plan's sort_date: the church's local wall-clock time, despite its UTC "Z"."""
+    moment = _when(value)
+    return moment.replace(tzinfo=zone) if moment else None
+
+
 def _plan_path(service_type_id: str, plan_id: str) -> str:
     st = check_id(service_type_id, "service_type_id")
     plan = check_id(plan_id, "plan_id")
@@ -136,46 +144,85 @@ def _complete(doc: Document, what: str) -> Document:
 
 @mcp.tool(annotations=READ)
 async def my_schedule(limit: int = 10) -> dict:
-    """When you're next serving: date, service, team, position and response status.
+    """When you're next serving: date, service and rehearsal times, team, position and status.
 
-    Returns service_type_id and plan_id for plan_team, service_order and attachments.
+    Times are local to the church, in the returned time_zone; times is null where Planning
+    Center doesn't show you the plan. Returns service_type_id and plan_id for plan_team,
+    service_order and attachments.
     """
     found, incomplete = await _upcoming(limit)
-    return {"schedules": found, "incomplete": incomplete}
+    zone = await _zone()
+    # Several positions on one plan share its times, so fetch each plan's once.
+    by_plan: dict[tuple, tuple[list | None, bool]] = {}
+    for entry in found:
+        plan = (entry["service_type_id"], entry["plan_id"])
+        if plan not in by_plan:
+            by_plan[plan] = await _plan_times(*plan, zone)
+        entry["times"], cut_short = by_plan[plan]
+        incomplete = incomplete or cut_short
+    return {"time_zone": str(zone), "schedules": found, "incomplete": incomplete}
+
+
+async def _plan_times(
+    service_type_id: str | None, plan_id: str | None, zone
+) -> tuple[list | None, bool]:
+    """A plan's times in local time (None if not visible), and whether the list was cut short."""
+    if not (service_type_id and plan_id):
+        return None, False
+    try:
+        doc = await state.api().get_all(f"{_plan_path(service_type_id, plan_id)}/plan_times")
+    except PcoError as exc:
+        if exc.status in _HIDDEN:
+            return None, False
+        raise
+    times = [
+        {
+            "type": t["attributes"].get("time_type"),
+            "name": t["attributes"].get("name"),
+            "starts": _local(t["attributes"].get("starts_at"), zone),
+            "ends": _local(t["attributes"].get("ends_at"), zone),
+        }
+        for t in doc.data
+    ]
+    return sorted(times, key=lambda t: t["starts"] or ""), doc.incomplete
 
 
 async def _upcoming(limit: int) -> tuple[list[dict], bool]:
     """Your next `limit` schedule entries, and whether the search stopped early."""
     api = state.api()
     me = await api.me_id()
+    zone = await _zone()
     cutoff = datetime.now(timezone.utc) - _STILL_CURRENT
-    found: list[dict] = []
+    found: list[tuple[datetime, dict]] = []
     incomplete = False
     try:
         async for page in api.pages(f"{SERVICES}/people/{me}/schedules", order="starts_at"):
             for sched in page.get("data") or []:
                 attrs = sched["attributes"]
-                if (_when(attrs.get("sort_date")) or cutoff) < cutoff:
+                when = _wall_clock(attrs.get("sort_date"), zone)
+                if when and when < cutoff:
                     continue
                 found.append(
-                    {
-                        "dates": attrs.get("dates"),
-                        "sort_date": attrs.get("sort_date"),
-                        "service_type": attrs.get("service_type_name"),
-                        "team": attrs.get("team_name"),
-                        "position": attrs.get("team_position_name"),
-                        "status": _STATUS.get(attrs.get("status"), attrs.get("status")),
-                        "plan_visible": attrs.get("plan_visible_to_me"),
-                        "service_type_id": related_id(sched, "service_type"),
-                        "plan_id": related_id(sched, "plan"),
-                    }
+                    (
+                        when or _UNDATED,
+                        {
+                            "dates": attrs.get("dates"),
+                            "service_type": attrs.get("service_type_name"),
+                            "team": attrs.get("team_name"),
+                            "position": attrs.get("team_position_name"),
+                            "status": _STATUS.get(attrs.get("status"), attrs.get("status")),
+                            "plan_visible": attrs.get("plan_visible_to_me"),
+                            "service_type_id": related_id(sched, "service_type"),
+                            "plan_id": related_id(sched, "plan"),
+                        },
+                    )
                 )
             if len(found) >= limit:
                 break
     except MorePagesError:
         incomplete = True
-    found.sort(key=lambda s: s["sort_date"] or "")
-    return found[:limit], incomplete
+    found.sort(key=lambda f: f[0])
+    return [entry for _, entry in found[:limit]], incomplete
 
 
 def _team_name(doc: Document, member: dict) -> str:
@@ -486,6 +533,7 @@ async def _plan_folder(path: str, service_type_id: str):
     if st not in state.service_type_names:
         data = (await api.get(f"{SERVICES}/service_types/{st}"))["data"]["attributes"]
         state.service_type_names[st] = data.get("name") or "Service"
+    # sort_date is local wall-clock time, so its date part is the local date.
     day = (plan.get("sort_date") or "")[:10] or "undated"
     base = downloads.root()
     folder = downloads.confined(base, downloads.safe_name(f"{day} {state.service_type_names[st]}"))

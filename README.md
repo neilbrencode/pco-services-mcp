@@ -12,7 +12,7 @@ Planning Center and nothing more.
 
 | Tool | Does |
 |---|---|
-| `my_schedule` | When you're next serving: date, service, team, position, and whether you've accepted |
+| `my_schedule` | When you're next serving: date, service and rehearsal times (in the church's time zone), team, position, and whether you've accepted |
 | `plan_team` | Who else is scheduled on that plan, grouped by team |
 | `team_contacts` | Email addresses and phone numbers for the people on that plan |
 | `contact_info` | Someone's email and phone, found by name among the people on your upcoming plans |
