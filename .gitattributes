@@ -1,0 +1,2 @@
+# LF everywhere: the hooks are POSIX shell scripts and break with CRLF.
+* text=auto eol=lf

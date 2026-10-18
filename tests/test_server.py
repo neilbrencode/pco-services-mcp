@@ -1,0 +1,492 @@
+"""Tools exercised through a real in-process MCP client against the fake API."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import date
+
+import httpx
+import pytest
+from mcp.client import Client
+
+from pco_services_mcp import server
+
+from .conftest import ME, error, jsonapi
+
+PLAN = "/services/v2/service_types/20/plans/300"
+ARGS = {"service_type_id": "20", "plan_id": "300"}
+
+
+async def call(name: str, args: dict | None = None):
+    async with Client(server.mcp) as c:
+        result = await c.call_tool(name, args or {})
+    text = result.content[0].text
+    return (True, text) if result.is_error else (False, json.loads(text))
+
+
+def schedule(sid: str, when: str, plan: str = "300") -> dict:
+    return {
+        "type": "Schedule",
+        "id": sid,
+        "attributes": {
+            "dates": when[:10],
+            "sort_date": when,
+            "service_type_name": "Sunday",
+            "team_name": "Band",
+            "team_position_name": "Keys",
+            "status": "C",
+        },
+        "relationships": {
+            "service_type": {"data": {"type": "ServiceType", "id": "20"}},
+            "plan": {"data": {"type": "Plan", "id": plan}},
+        },
+    }
+
+
+def on_my_schedule(fake, scheduled: bool = True) -> None:
+    fake.route(
+        "GET",
+        f"{PLAN}/my_schedules",
+        jsonapi([schedule("9", "2099-01-01T17:00:00Z")] if scheduled else []),
+    )
+
+
+async def test_my_schedule_skips_the_past_and_respects_limit(fake):
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi(
+            [
+                schedule("1", "2000-01-01T17:00:00Z"),
+                schedule("2", "2099-01-08T17:00:00Z"),
+                schedule("3", "2099-01-01T17:00:00Z"),
+            ]
+        ),
+    )
+    is_error, out = await call("my_schedule", {"limit": 1})
+    assert not is_error
+    assert [s["sort_date"] for s in out["schedules"]] == ["2099-01-01T17:00:00Z"]
+    assert out["schedules"][0]["status"] == "confirmed"
+    assert out["incomplete"] is False
+
+
+async def test_my_schedule_finds_the_next_service_after_many_pages_of_history(fake):
+    url = f"https://api.planningcenteronline.com/services/v2/people/{ME}/schedules"
+    pages = iter(
+        [
+            jsonapi(
+                [schedule(str(i), "2000-01-01T00:00:00Z") for i in range(100)],
+                next_url=url + "?offset=" + str(n),
+            )
+            for n in range(1, 7)
+        ]
+        + [jsonapi([schedule("next", "2099-02-01T17:00:00Z")])]
+    )
+    fake.route("GET", f"/services/v2/people/{ME}/schedules", lambda r: next(pages))
+    _, out = await call("my_schedule")
+    assert [s["sort_date"] for s in out["schedules"]] == ["2099-02-01T17:00:00Z"]
+
+
+async def test_my_schedule_reports_an_unfinished_traversal(fake):
+    url = f"https://api.planningcenteronline.com/services/v2/people/{ME}/schedules?offset=1"
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi([schedule("1", "2000-01-01T00:00:00Z")], next_url=url),
+    )
+    _, out = await call("my_schedule")
+    assert out == {"schedules": [], "incomplete": True}
+
+
+@pytest.mark.parametrize(
+    "tool", ["plan_team", "service_order", "list_attachments", "download_attachments"]
+)
+@pytest.mark.parametrize("reply", ["empty", "404"])
+async def test_plan_tools_refuse_plans_not_on_my_schedule(fake, tool, reply):
+    if reply == "empty":
+        on_my_schedule(fake, scheduled=False)
+    else:
+        fake.route("GET", f"{PLAN}/my_schedules", error(404))
+    is_error, text = await call(tool, ARGS)
+    assert is_error and "isn't on your schedule" in text
+    assert fake.paths() == [f"{PLAN}/my_schedules"]
+
+
+async def test_plan_ids_must_be_numeric(fake):
+    is_error, text = await call("plan_team", {"service_type_id": "20", "plan_id": "300/../1"})
+    assert is_error and "numeric" in text
+    assert fake.requests == []
+
+
+async def test_plan_team_groups_by_team(fake):
+    on_my_schedule(fake)
+    member = lambda pid, team, name: {  # noqa: E731
+        "type": "PlanPerson",
+        "id": pid,
+        "attributes": {
+            "name": name,
+            "team_position_name": "Vocals",
+            "status": "U",
+            "notes": "private",
+        },
+        "relationships": {"team": {"data": {"type": "Team", "id": team}}},
+    }
+    fake.route(
+        "GET",
+        f"{PLAN}/team_members",
+        jsonapi(
+            [member("1", "t1", "Alex Example"), member("2", "t2", "Sam Sample")],
+            included=[
+                {"type": "Team", "id": "t1", "attributes": {"name": "Band"}},
+                {"type": "Team", "id": "t2", "attributes": {"name": "Tech"}},
+            ],
+        ),
+    )
+    _, out = await call("plan_team", ARGS)
+    assert out["teams"] == {
+        "Band": [{"name": "Alex Example", "position": "Vocals", "status": "unconfirmed"}],
+        "Tech": [{"name": "Sam Sample", "position": "Vocals", "status": "unconfirmed"}],
+    }
+
+
+def items_route(fake):
+    fake.route(
+        "GET",
+        f"{PLAN}/items",
+        jsonapi(
+            [
+                {
+                    "type": "Item",
+                    "id": "i2",
+                    "attributes": {
+                        "sequence": 2,
+                        "title": "Example Song",
+                        "item_type": "song",
+                        "key_name": "D",
+                        "length": 245,
+                    },
+                    "relationships": {
+                        "song": {"data": {"type": "Song", "id": "s1"}},
+                        "arrangement": {"data": {"type": "Arrangement", "id": "a1"}},
+                        "key": {"data": {"type": "Key", "id": "k1"}},
+                    },
+                },
+                {
+                    "type": "Item",
+                    "id": "i1",
+                    "attributes": {"sequence": 1, "title": "Welcome", "item_type": "item"},
+                    "relationships": {},
+                },
+            ],
+            included=[
+                {"type": "Song", "id": "s1", "attributes": {"author": "A. Writer"}},
+                {"type": "Arrangement", "id": "a1", "attributes": {"name": "Default"}},
+            ],
+        ),
+    )
+
+
+async def test_service_order_is_sorted_and_described(fake):
+    on_my_schedule(fake)
+    fake.route(
+        "GET",
+        PLAN,
+        jsonapi({"type": "Plan", "id": "300", "attributes": {"dates": "January 1, 2099"}}),
+    )
+    items_route(fake)
+    _, out = await call("service_order", ARGS)
+    assert [i["title"] for i in out["items"]] == ["Welcome", "Example Song"]
+    assert out["items"][1] | {} == {
+        "title": "Example Song",
+        "type": "song",
+        "when": None,
+        "key": "D",
+        "length": "4:05",
+        "author": "A. Writer",
+        "arrangement": "Default",
+        "sequence": None,
+        "description": None,
+    }
+
+
+def attachment(
+    aid: str, kind: str, rid: str, *, downloadable=True, filename="Chart.pdf", filetype="pdf"
+):
+    return {
+        "type": "Attachment",
+        "id": aid,
+        "attributes": {
+            "filename": filename,
+            "filetype": filetype,
+            "downloadable": downloadable,
+            "linked_url": "https://services.planningcenteronline.com/attachments/x",
+            "updated_at": "2099-01-01T00:00:00Z",
+        },
+        "relationships": {"attachable": {"data": {"type": kind, "id": rid}}},
+        "links": {"self": f"https://api.planningcenteronline.com{PLAN}/all_attachments/{aid}"},
+    }
+
+
+def attachments_route(fake, *atts):
+    fake.route("GET", f"{PLAN}/all_attachments", jsonapi(list(atts)))
+
+
+def plan_and_service_type_routes(fake):
+    fake.route(
+        "GET",
+        PLAN,
+        jsonapi({"type": "Plan", "id": "300", "attributes": {"sort_date": "2099-01-01T17:00:00Z"}}),
+    )
+    fake.route(
+        "GET",
+        "/services/v2/service_types/20",
+        jsonapi({"type": "ServiceType", "id": "20", "attributes": {"name": "Sunday AM"}}),
+    )
+
+
+def open_route(fake, aid: str):
+    """`/open` hands back a storage URL whose path is /b/<aid>."""
+    fake.route(
+        "POST",
+        f"{PLAN}/all_attachments/{aid}/open",
+        jsonapi(
+            {
+                "type": "AttachmentActivity",
+                "id": "1",
+                "attributes": {"attachment_url": f"https://s3.amazonaws.com/b/{aid}?sig=x"},
+            }
+        ),
+    )
+
+
+async def test_attachments_are_labelled_by_song(fake):
+    on_my_schedule(fake)
+    items_route(fake)
+    attachments_route(
+        fake,
+        attachment("50", "Key", "k1"),
+        attachment("51", "Item", "i1", downloadable=False, filetype="video"),
+    )
+    _, out = await call("list_attachments", ARGS)
+    by_id = {a["id"]: a for a in out["attachments"]}
+    assert by_id["50"]["for"] == "Example Song" and by_id["50"]["link"] is None
+    assert by_id["51"]["for"] == "Welcome" and not by_id["51"]["downloadable"]
+    assert by_id["51"]["link"]
+
+
+async def test_download_refuses_an_attachment_from_another_plan(fake):
+    on_my_schedule(fake)
+    items_route(fake)
+    attachments_route(fake, attachment("50", "Key", "k1"))
+    is_error, text = await call("download_attachments", {**ARGS, "attachment_ids": ["999"]})
+    assert is_error and "Not attachments of this plan: 999" in text
+    assert not any(p.endswith("/open") for p in fake.paths())
+
+
+async def test_download_saves_once_then_reuses(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("PCO_DOWNLOAD_DIR", str(tmp_path))
+    on_my_schedule(fake)
+    items_route(fake)
+    plan_and_service_type_routes(fake)
+    attachments_route(
+        fake,
+        attachment("50", "Key", "k1"),
+        attachment("52", "Song", "s1", filetype="audio", filename="a.mp3"),
+    )
+    open_route(fake, "50")
+    fake.route("GET", "/b/50", httpx.Response(200, content=b"%PDF-synthetic"))
+
+    _, first = await call("download_attachments", {**ARGS, "file_types": ["PDF"]})
+    assert first["saved"] == ["Chart.pdf"] and first["failed"] == []
+    assert (tmp_path / "2099-01-01 Sunday AM" / "Chart.pdf").read_bytes() == b"%PDF-synthetic"
+    _, second = await call("download_attachments", {**ARGS, "file_types": ["pdf"]})
+    assert second["saved"] == [] and second["already_current"] == ["Chart.pdf"]
+    assert fake.paths("POST").count(f"{PLAN}/all_attachments/50/open") == 1
+
+
+async def test_an_unfinished_attachment_list_is_refused(fake):
+    on_my_schedule(fake)
+    items_route(fake)
+    more = f"https://api.planningcenteronline.com{PLAN}/all_attachments?offset=1"
+    fake.route(
+        "GET", f"{PLAN}/all_attachments", jsonapi([attachment("50", "Key", "k1")], next_url=more)
+    )
+    is_error, text = await call("list_attachments", ARGS)
+    assert is_error and "too long" in text
+    is_error, text = await call("download_attachments", ARGS)
+    assert is_error and "too long" in text
+    assert not any(p.endswith("/open") for p in fake.paths())
+
+
+async def test_concurrent_downloads_of_one_plan_keep_both_files(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("PCO_DOWNLOAD_DIR", str(tmp_path))
+    on_my_schedule(fake)
+    items_route(fake)
+    plan_and_service_type_routes(fake)
+    attachments_route(fake, attachment("50", "Key", "k1"), attachment("53", "Song", "s1"))
+
+    async def slow_file(request):
+        await asyncio.sleep(0.05)  # lets the other call run, as real network I/O would
+        return httpx.Response(200, content=b"%PDF-" + request.url.path[-2:].encode())
+
+    for aid in ("50", "53"):
+        open_route(fake, aid)
+        fake.route("GET", f"/b/{aid}", slow_file)
+
+    results = await asyncio.gather(
+        *(call("download_attachments", {**ARGS, "attachment_ids": [a]}) for a in ("50", "53"))
+    )
+    assert sorted(name for _, out in results for name in out["saved"]) == [
+        "Chart (53).pdf",
+        "Chart.pdf",
+    ]
+    folder = tmp_path / "2099-01-01 Sunday AM"
+    contents = {p.read_bytes() for p in folder.glob("Chart*.pdf")}
+    assert contents == {b"%PDF-50", b"%PDF-53"}
+    manifest = json.loads((folder / ".pco-attachments.json").read_text(encoding="utf-8"))
+    assert set(manifest) == {"50", "53"}
+
+
+async def test_errors_reach_the_client_with_their_text(fake):
+    fake.route("GET", "/services/v2/me", error(401, "token revoked"))
+    is_error, text = await call("list_blockouts")
+    assert is_error and "token revoked" in text and "pco-services-mcp login" in text
+
+
+def blockout(bid: str, starts: str, ends: str, **attrs) -> dict:
+    return {
+        "type": "Blockout",
+        "id": bid,
+        "attributes": {"starts_at": starts, "ends_at": ends, **attrs},
+    }
+
+
+async def test_list_blockouts_hides_finished_ones_but_keeps_live_series(fake):
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/blockouts",
+        jsonapi(
+            [
+                blockout("old", "2000-01-01T08:00:00Z", "2000-01-02T07:59:59Z"),
+                blockout(
+                    "series", "2000-01-01T08:00:00Z", "2000-01-02T07:59:59Z", repeat_period="weekly"
+                ),
+                blockout(
+                    "ended",
+                    "2000-01-01T08:00:00Z",
+                    "2000-01-02T07:59:59Z",
+                    repeat_period="weekly",
+                    repeat_until="2000-06-01",
+                ),
+                blockout("soon", "2099-01-01T08:00:00Z", "2099-01-02T07:59:59Z", reason="Trip"),
+            ]
+        ),
+    )
+    _, out = await call("list_blockouts")
+    assert [b["id"] for b in out["blockouts"]] == ["series", "soon"]
+    assert out["blockouts"][1]["starts"] == "2099-01-01 00:00"
+    _, everything = await call("list_blockouts", {"include_past": True})
+    assert len(everything["blockouts"]) == 4
+
+
+def test_a_blockout_that_ended_last_night_locally_is_finished():
+    from zoneinfo import ZoneInfo
+
+    # 23:59:59 on 1 January in Los Angeles is 07:59:59 on 2 January in UTC.
+    b = blockout("x", "2099-01-01T08:00:00Z", "2099-01-02T07:59:59Z")
+    zone = ZoneInfo("America/Los_Angeles")
+    assert server._still_relevant(b, date(2099, 1, 1), zone)
+    assert not server._still_relevant(b, date(2099, 1, 2), zone)
+
+
+async def test_add_blockout_sends_the_built_payload_for_me(fake):
+    fake.route(
+        "POST",
+        f"/services/v2/people/{ME}/blockouts",
+        lambda r: jsonapi(
+            {
+                "type": "Blockout",
+                "id": "77",
+                "attributes": json.loads(r.content)["data"]["attributes"],
+            }
+        ),
+    )
+    is_error, out = await call(
+        "add_blockout",
+        {
+            "start": "2099-03-01",
+            "repeat": "monthly",
+            "monthly_by": "week_1",
+            "repeat_until": "2099-12-31",
+            "reason": "Away",
+        },
+    )
+    assert not is_error, out
+    [body] = fake.bodies("POST", f"/services/v2/people/{ME}/blockouts")
+    assert body == {
+        "data": {
+            "type": "Blockout",
+            "attributes": {
+                "starts_at": "2099-03-01T08:00:00Z",
+                "ends_at": "2099-03-02T07:59:59Z",
+                "reason": "Away",
+                "repeat_period": "monthly",
+                "repeat_frequency": "every_1",
+                "repeat_interval": "week_of_month_1",
+                "repeat_until": "2099-12-31",
+            },
+        }
+    }
+    assert out["created"]["id"] == "77"
+
+
+async def test_time_zone_override(fake, monkeypatch):
+    monkeypatch.setenv("PCO_TIME_ZONE", "America/New_York")
+    fake.route(
+        "POST",
+        f"/services/v2/people/{ME}/blockouts",
+        lambda r: jsonapi({"type": "Blockout", "id": "1", "attributes": {}}),
+    )
+    await call("add_blockout", {"start": "2099-01-10"})
+    [body] = fake.bodies("POST", f"/services/v2/people/{ME}/blockouts")
+    assert body["data"]["attributes"]["starts_at"] == "2099-01-10T05:00:00Z"
+    assert "/services/v2" not in fake.paths("GET")
+
+
+async def test_unusable_org_zone_refuses_without_writing(fake):
+    fake.route(
+        "GET",
+        "/services/v2",
+        jsonapi({"type": "Organization", "id": "1", "attributes": {"time_zone": "Mars/Base"}}),
+    )
+    is_error, text = await call("add_blockout", {"start": "2099-01-10"})
+    assert is_error and "PCO_TIME_ZONE" in text
+    assert fake.paths("POST") == []
+
+
+async def test_remove_and_skip_always_target_me(fake):
+    fake.route("DELETE", f"/services/v2/people/{ME}/blockouts/5", httpx.Response(204))
+    fake.route(
+        "POST",
+        f"/services/v2/people/{ME}/blockouts/5/blockout_exceptions",
+        jsonapi({"type": "BlockoutException", "id": "1"}),
+    )
+    assert (await call("remove_blockout", {"blockout_id": "5"}))[1] == {"removed": "5"}
+    assert (await call("skip_blockout_date", {"blockout_id": "5", "date": "2099-01-03"}))[1][
+        "available_on"
+    ] == "2099-01-03"
+    [body] = fake.bodies("POST", f"/services/v2/people/{ME}/blockouts/5/blockout_exceptions")
+    assert body["data"]["attributes"] == {"date": "2099-01-03"}
+    assert (await call("remove_blockout", {"blockout_id": "5/../../2"}))[0]
+
+
+async def test_write_tools_are_annotated():
+    async with Client(server.mcp) as c:
+        tools = {t.name: t.annotations for t in (await c.list_tools()).tools}
+    assert (
+        tools["remove_blockout"].destructive_hint and tools["skip_blockout_date"].destructive_hint
+    )
+    assert tools["add_blockout"].read_only_hint is False
+    for name in ("my_schedule", "plan_team", "service_order", "list_attachments", "list_blockouts"):
+        assert tools[name].read_only_hint

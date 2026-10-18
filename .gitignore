@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Tools
+.ruff_cache/
+.pytest_cache/
+.coverage
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Never commit: local identifying terms, credentials, or anything downloaded from
+# Planning Center (charts, audio, real API responses).
+.leakcheck-denylist
+.env
+.env.*
+downloads/
+*.pdf
+*.mp3
+*.m4a
+*.wav
+*.chordpro
+*.onsong
+.pco-attachments.json
+*.log

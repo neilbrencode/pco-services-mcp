@@ -1,0 +1,3 @@
+#!/bin/sh
+# Refuse a commit whose staged paths or added lines would reveal the church or a credential.
+exec uv run --quiet python scripts/leak_check.py --staged

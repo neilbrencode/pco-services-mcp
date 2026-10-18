@@ -1,0 +1,3 @@
+#!/bin/sh
+# Apply the same leak check to the commit message.
+exec uv run --quiet python scripts/leak_check.py --message "$1"
