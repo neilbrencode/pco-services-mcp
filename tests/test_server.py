@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -26,6 +27,7 @@ async def call(name: str, args: dict | None = None):
 
 
 def schedule(sid: str, when: str, plan: str = "300") -> dict:
+    """A schedule entry; `when` is local wall-clock time with a "Z", as Planning Center sends it."""
     return {
         "type": "Schedule",
         "id": sid,
@@ -48,7 +50,7 @@ def on_my_schedule(fake, scheduled: bool = True) -> None:
     fake.route(
         "GET",
         f"{PLAN}/my_schedules",
-        jsonapi([schedule("9", "2099-01-01T17:00:00Z")] if scheduled else []),
+        jsonapi([schedule("9", "2099-01-01T09:00:00Z")] if scheduled else []),
     )
 
 
@@ -58,17 +60,112 @@ async def test_my_schedule_skips_the_past_and_respects_limit(fake):
         f"/services/v2/people/{ME}/schedules",
         jsonapi(
             [
-                schedule("1", "2000-01-01T17:00:00Z"),
-                schedule("2", "2099-01-08T17:00:00Z"),
-                schedule("3", "2099-01-01T17:00:00Z"),
+                schedule("1", "2000-01-01T09:00:00Z"),
+                schedule("2", "2099-01-08T09:00:00Z"),
+                schedule("3", "2099-01-01T09:00:00Z"),
             ]
         ),
     )
     is_error, out = await call("my_schedule", {"limit": 1})
     assert not is_error
-    assert [s["sort_date"] for s in out["schedules"]] == ["2099-01-01T17:00:00Z"]
+    assert [s["dates"] for s in out["schedules"]] == ["2099-01-01"]
     assert out["schedules"][0]["status"] == "confirmed"
     assert out["incomplete"] is False
+
+
+def plan_time(tid: str, kind: str, starts: str, ends: str) -> dict:
+    attrs = {"time_type": kind, "name": kind.title(), "starts_at": starts, "ends_at": ends}
+    return {"type": "PlanTime", "id": tid, "attributes": attrs}
+
+
+async def test_my_schedule_gives_service_and_rehearsal_times_in_local_time(fake):
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi([schedule("1", "2099-01-01T09:00:00Z")]),
+    )
+    fake.route(
+        "GET",
+        f"{PLAN}/plan_times",
+        jsonapi(
+            [
+                plan_time("2", "service", "2099-01-01T17:00:00Z", "2099-01-01T18:15:00Z"),
+                plan_time("1", "rehearsal", "2099-01-01T15:30:00Z", "2099-01-01T16:30:00Z"),
+            ]
+        ),
+    )
+    _, out = await call("my_schedule")
+    assert out["time_zone"] == "America/Los_Angeles"
+    [entry] = out["schedules"]
+    assert "sort_date" not in entry
+    assert entry["times"] == [
+        {
+            "type": "rehearsal",
+            "name": "Rehearsal",
+            "starts": "2099-01-01 07:30",
+            "ends": "2099-01-01 08:30",
+        },
+        {
+            "type": "service",
+            "name": "Service",
+            "starts": "2099-01-01 09:00",
+            "ends": "2099-01-01 10:15",
+        },
+    ]
+
+
+async def test_my_schedule_reports_hidden_plan_times_as_null(fake):
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi([schedule("1", "2099-01-01T09:00:00Z")]),
+    )
+    fake.route("GET", f"{PLAN}/plan_times", error(403))
+    _, out = await call("my_schedule")
+    assert out["schedules"][0]["times"] is None
+
+
+async def test_my_schedule_fetches_each_plans_times_once_and_reports_truncation(fake):
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi([schedule("1", "2099-01-01T09:00:00Z"), schedule("2", "2099-01-01T09:00:00Z")]),
+    )
+    more = f"https://api.planningcenteronline.com{PLAN}/plan_times?offset=1"
+    fake.route("GET", f"{PLAN}/plan_times", jsonapi([], next_url=more))
+    _, out = await call("my_schedule")
+    assert len(out["schedules"]) == 2
+    assert out["incomplete"] is True
+    # The fake answers every page with another next link, so ten pages were read, once.
+    assert fake.paths().count(f"{PLAN}/plan_times") == 10
+
+
+async def test_my_schedule_puts_undated_entries_after_dated_ones(fake):
+    undated = schedule("1", "undated", plan="301")
+    undated["attributes"]["sort_date"] = None
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi([undated, schedule("2", "2099-01-01T09:00:00Z")]),
+    )
+    _, out = await call("my_schedule", {"limit": 1})
+    assert [s["plan_id"] for s in out["schedules"]] == ["300"]
+
+
+async def test_my_schedule_reads_sort_date_as_local_wall_clock_time(fake):
+    # Ten local hours ago is still today's service. Read as UTC, the same sort_date would be
+    # 17 or 18 hours ago in Los Angeles and fall outside the 12-hour window.
+    zone = ZoneInfo("America/Los_Angeles")
+    now = datetime.now(zone)
+    recent = (now - timedelta(hours=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale = (now - timedelta(hours=13)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fake.route(
+        "GET",
+        f"/services/v2/people/{ME}/schedules",
+        jsonapi([schedule("1", stale, plan="301"), schedule("2", recent)]),
+    )
+    _, out = await call("my_schedule")
+    assert [s["plan_id"] for s in out["schedules"]] == ["300"]
 
 
 async def test_my_schedule_finds_the_next_service_after_many_pages_of_history(fake):
@@ -81,11 +178,11 @@ async def test_my_schedule_finds_the_next_service_after_many_pages_of_history(fa
             )
             for n in range(1, 7)
         ]
-        + [jsonapi([schedule("next", "2099-02-01T17:00:00Z")])]
+        + [jsonapi([schedule("next", "2099-02-01T09:00:00Z")])]
     )
     fake.route("GET", f"/services/v2/people/{ME}/schedules", lambda r: next(pages))
     _, out = await call("my_schedule")
-    assert [s["sort_date"] for s in out["schedules"]] == ["2099-02-01T17:00:00Z"]
+    assert [s["dates"] for s in out["schedules"]] == ["2099-02-01"]
 
 
 async def test_my_schedule_reports_an_unfinished_traversal(fake):
@@ -96,7 +193,7 @@ async def test_my_schedule_reports_an_unfinished_traversal(fake):
         jsonapi([schedule("1", "2000-01-01T00:00:00Z")], next_url=url),
     )
     _, out = await call("my_schedule")
-    assert out == {"schedules": [], "incomplete": True}
+    assert out == {"time_zone": "America/Los_Angeles", "schedules": [], "incomplete": True}
 
 
 @pytest.mark.parametrize(
@@ -242,9 +339,9 @@ async def test_contact_info_searches_my_upcoming_plans_by_name(fake):
         f"/services/v2/people/{ME}/schedules",
         jsonapi(
             [
-                schedule("1", "2099-01-01T17:00:00Z"),
-                schedule("2", "2099-01-01T17:00:00Z"),
-                schedule("3", "2099-01-08T17:00:00Z", plan="301"),
+                schedule("1", "2099-01-01T09:00:00Z"),
+                schedule("2", "2099-01-01T09:00:00Z"),
+                schedule("3", "2099-01-08T09:00:00Z", plan="301"),
             ]
         ),
     )
@@ -287,7 +384,7 @@ async def test_contact_info_asks_for_more_of_a_common_name(fake):
     fake.route(
         "GET",
         f"/services/v2/people/{ME}/schedules",
-        jsonapi([schedule("1", "2099-01-01T17:00:00Z")]),
+        jsonapi([schedule("1", "2099-01-01T09:00:00Z")]),
     )
     team_members_route(
         fake, *(member(f"m{i}", "t1", f"Pat Example {i}", str(3000 + i)) for i in range(6))
@@ -389,7 +486,7 @@ def plan_and_service_type_routes(fake):
     fake.route(
         "GET",
         PLAN,
-        jsonapi({"type": "Plan", "id": "300", "attributes": {"sort_date": "2099-01-01T17:00:00Z"}}),
+        jsonapi({"type": "Plan", "id": "300", "attributes": {"sort_date": "2099-01-01T09:00:00Z"}}),
     )
     fake.route(
         "GET",
