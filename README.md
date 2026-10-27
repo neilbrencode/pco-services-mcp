@@ -3,7 +3,7 @@
 A local [MCP](https://modelcontextprotocol.io) server that lets Claude (Claude Code, Claude
 Desktop, or any MCP client) work with **your own** Planning Center Services schedule as a
 volunteer. It's for churches that haven't turned on Planning Center's hosted MCP connector,
-and it covers the one thing that connector can't do: managing your blockout dates.
+and it can also manage your blockout dates and answer your scheduling requests.
 
 It signs in with your own Personal Access Token, so it sees exactly what you can see in
 Planning Center and nothing more.
@@ -12,7 +12,9 @@ Planning Center and nothing more.
 
 | Tool | Does |
 |---|---|
-| `my_schedule` | When you're next serving: date, service and rehearsal times (in the church's time zone), team, position, and whether you've accepted |
+| `my_schedule` | When you're next serving: date, service and rehearsal times (in the church's time zone), team, position, and whether you've accepted (`include_declined: true` also lists requests you declined) |
+| `accept_request` | Accept a scheduling request, or one you declined earlier |
+| `decline_request` | Decline a scheduling request, or one you accepted, with an optional reason for the scheduler |
 | `plan_team` | Who else is scheduled on that plan, grouped by team |
 | `team_contacts` | Email addresses and phone numbers for the people on that plan |
 | `contact_info` | Someone's email and phone, found by name among the people on your upcoming plans |
@@ -28,6 +30,11 @@ The plan tools only work for plans **you're scheduled on**. `plan_team` shows pe
 team, position and status only. The two contact tools show email addresses and phone numbers,
 and only where Planning Center already lets you see them (usually the people on your own
 teams); for anyone else they say the details aren't visible, rather than working around it.
+
+`accept_request` and `decline_request` answer every time on a request; they can't accept only
+some times, and they never propose a replacement (which would make Planning Center contact
+someone else). Each one reads the request back afterwards and says whether the new answer
+shows.
 
 ## Set up
 

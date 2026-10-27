@@ -28,6 +28,8 @@ from pco_services_mcp.client import (
 
 ENV_TIME_ZONE = "PCO_TIME_ZONE"
 _STATUS = {"C": "confirmed", "U": "unconfirmed", "D": "declined"}
+# Planning Center leaves declined requests out of a person's schedules unless asked.
+_WITH_DECLINED = "with_declined"
 # A service that started a few hours ago is still "today's" service.
 _STILL_CURRENT = timedelta(hours=12)
 # Schedule entries without a date sort after the dated ones.
@@ -37,8 +39,10 @@ INSTRUCTIONS = """\
 Planning Center Services for the signed-in volunteer only. Start with my_schedule: it gives
 the service_type_id and plan_id the other plan tools need. plan_team, team_contacts,
 service_order and the attachment tools only work for plans on the user's own schedule.
-contact_info finds someone by name among the people on the user's upcoming plans. Blockout
-dates given as YYYY-MM-DD cover the whole day in the church's time zone."""
+contact_info finds someone by name among the people on the user's upcoming plans.
+accept_request and decline_request answer a scheduling request by its schedule_id from
+my_schedule, or change an earlier answer; my_schedule(include_declined=True) also lists declined
+requests. Blockout dates given as YYYY-MM-DD cover the whole day in the church's time zone."""
 
 
 def _client() -> PcoClient:
@@ -143,14 +147,15 @@ def _complete(doc: Document, what: str) -> Document:
 
 
 @mcp.tool(annotations=READ)
-async def my_schedule(limit: int = 10) -> dict:
+async def my_schedule(limit: int = 10, include_declined: bool = False) -> dict:
     """When you're next serving: date, service and rehearsal times, team, position and status.
 
     Times are local to the church, in the returned time_zone; times is null where Planning
     Center doesn't show you the plan. Returns service_type_id and plan_id for plan_team,
-    service_order and attachments.
+    service_order and attachments, and schedule_id for accept_request and decline_request.
+    Requests you declined are left out unless include_declined is true.
     """
-    found, incomplete = await _upcoming(limit)
+    found, incomplete = await _upcoming(limit, include_declined=include_declined)
     zone = await _zone()
     # Several positions on one plan share its times, so fetch each plan's once.
     by_plan: dict[tuple, tuple[list | None, bool]] = {}
@@ -187,7 +192,20 @@ async def _plan_times(
     return sorted(times, key=lambda t: t["starts"] or ""), doc.incomplete
 
 
-async def _upcoming(limit: int) -> tuple[list[dict], bool]:
+def _request(sched: dict) -> dict:
+    """What a schedule entry asks of you: when, where and your answer so far."""
+    attrs = sched["attributes"]
+    return {
+        "schedule_id": check_id(sched["id"], "schedule id"),
+        "dates": attrs.get("dates"),
+        "service_type": attrs.get("service_type_name"),
+        "team": attrs.get("team_name"),
+        "position": attrs.get("team_position_name"),
+        "status": _STATUS.get(attrs.get("status"), attrs.get("status")),
+    }
+
+
+async def _upcoming(limit: int, *, include_declined: bool = False) -> tuple[list[dict], bool]:
     """Your next `limit` schedule entries, and whether the search stopped early."""
     api = state.api()
     me = await api.me_id()
@@ -195,23 +213,21 @@ async def _upcoming(limit: int) -> tuple[list[dict], bool]:
     cutoff = datetime.now(timezone.utc) - _STILL_CURRENT
     found: list[tuple[datetime, dict]] = []
     incomplete = False
+    params = {"filter": _WITH_DECLINED} if include_declined else {}
     try:
-        async for page in api.pages(f"{SERVICES}/people/{me}/schedules", order="starts_at"):
+        async for page in api.pages(
+            f"{SERVICES}/people/{me}/schedules", order="starts_at", **params
+        ):
             for sched in page.get("data") or []:
-                attrs = sched["attributes"]
-                when = _wall_clock(attrs.get("sort_date"), zone)
+                when = _wall_clock(sched["attributes"].get("sort_date"), zone)
                 if when and when < cutoff:
                     continue
                 found.append(
                     (
                         when or _UNDATED,
                         {
-                            "dates": attrs.get("dates"),
-                            "service_type": attrs.get("service_type_name"),
-                            "team": attrs.get("team_name"),
-                            "position": attrs.get("team_position_name"),
-                            "status": _STATUS.get(attrs.get("status"), attrs.get("status")),
-                            "plan_visible": attrs.get("plan_visible_to_me"),
+                            **_request(sched),
+                            "plan_visible": sched["attributes"].get("plan_visible_to_me"),
                             "service_type_id": related_id(sched, "service_type"),
                             "plan_id": related_id(sched, "plan"),
                         },
@@ -245,6 +261,105 @@ async def plan_team(service_type_id: str, plan_id: str) -> dict:
             }
         )
     return {"teams": dict(teams), "truncated": doc.incomplete}
+
+
+# ── Answering requests ──────────────────────────────────
+
+_ANSWERS = {"accept": "C", "decline": "D"}
+
+
+async def _find_request(base: str, sid: str) -> dict | None:
+    """Your Schedule `sid`, or None when Planning Center doesn't return it."""
+    api = state.api()
+    try:
+        return (await api.get(f"{base}/{sid}"))["data"]
+    except PcoError as exc:
+        if exc.status not in _HIDDEN:
+            raise
+    try:
+        async for page in api.pages(base, filter=_WITH_DECLINED):
+            for sched in page.get("data") or []:
+                if sched["id"] == sid:
+                    return sched
+    except MorePagesError:
+        raise PcoError("Your schedule is too long to search in full for that request.") from None
+    return None
+
+
+async def _answer(schedule_id: str, action: str, body: dict) -> dict:
+    """POST `action` to one of your Schedules, then read back the status it now has."""
+    sid = check_id(schedule_id, "schedule_id")
+    api = state.api()
+    me = await api.me_id()
+    base = f"{SERVICES}/people/{me}/schedules"
+    before = await _find_request(base, sid)
+    if before is None:
+        raise PcoError("That request isn't on your schedule.")
+    wanted = _ANSWERS[action]
+    if before["attributes"].get("status") == wanted:
+        return {**_request(before), "unchanged": True}
+    try:
+        await api.request("POST", f"{base}/{sid}/{action}", json=body)
+    except PcoError as exc:
+        if exc.status is not None:
+            raise
+        raise PcoError(
+            f"{exc} The {action} may or may not have reached Planning Center; check "
+            "my_schedule with include_declined before trying again."
+        ) from None
+    # The POST succeeded, so from here on report rather than raise: a retry is the harm.
+    try:
+        after = await _find_request(base, sid)
+    except PcoError as exc:
+        after, problem = None, str(exc)
+    else:
+        problem = "it no longer appears on your schedule"
+    if after is not None:
+        if after["attributes"].get("status") == wanted:
+            return {**_request(after), "verified": True}
+        problem = f"it still shows as {_request(after)['status']}"
+    return {
+        **_request(before),
+        "status": None if after is None else _request(after)["status"],
+        "verified": False,
+        "note": f"Planning Center took the {action}, but reading it back failed: {problem}.",
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    )
+)
+async def accept_request(schedule_id: str) -> dict:
+    """Accept a scheduling request (schedule_id from my_schedule), or one you declined earlier.
+
+    Accepts every time on the request. verified is false when Planning Center took the answer
+    but reading it back didn't show it; don't retry then, check my_schedule instead.
+    """
+    return await _answer(schedule_id, "accept", {})
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
+    )
+)
+async def decline_request(schedule_id: str, reason: str | None = None) -> dict:
+    """Decline a scheduling request (schedule_id from my_schedule), or one you accepted.
+
+    Declines every time on the request; reason is shown to the scheduler, who may give your
+    spot to someone else. verified is false when Planning Center took the answer but reading
+    it back didn't show it; don't retry then, check my_schedule instead.
+    """
+    body = {
+        "data": {
+            "type": "ScheduleDecline",
+            "attributes": {"reason": reason or ""},
+            "relationships": None,
+        }
+    }
+    return await _answer(schedule_id, "decline", body)
 
 
 # ── Contacts ────────────────────────────────────────────
