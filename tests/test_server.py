@@ -770,15 +770,18 @@ async def test_a_sent_answer_that_cannot_be_read_back_is_reported_not_raised(
     assert len(fake.paths("POST")) == 1
 
 
-async def test_a_lost_answer_says_it_may_have_gone_through(fake):
+def unreachable(request):
+    raise httpx.ConnectError("synthetic", request=request)
+
+
+@pytest.mark.parametrize(
+    ("reply", "uncertain"), [(unreachable, True), (error(502), True), (error(403), False)]
+)
+async def test_a_lost_answer_says_it_may_have_gone_through(fake, reply, uncertain):
     answerable(fake, "U")
-
-    def unreachable(request):
-        raise httpx.ConnectError("synthetic", request=request)
-
-    fake.route("POST", f"{SCHEDULES}/7/accept", unreachable)
+    fake.route("POST", f"{SCHEDULES}/7/accept", reply)
     is_error, text = await call("accept_request", {"schedule_id": "7"})
-    assert is_error and "may or may not have reached" in text
+    assert is_error and ("may or may not have reached" in text) is uncertain
 
 
 def blockout(bid: str, starts: str, ends: str, **attrs) -> dict:

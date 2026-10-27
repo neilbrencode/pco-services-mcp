@@ -301,7 +301,8 @@ async def _answer(schedule_id: str, action: str, body: dict) -> dict:
     try:
         await api.request("POST", f"{base}/{sid}/{action}", json=body)
     except PcoError as exc:
-        if exc.status is not None:
+        # No reply, or a server error, can come after the answer was saved.
+        if exc.status is not None and exc.status < 500:
             raise
         raise PcoError(
             f"{exc} The {action} may or may not have reached Planning Center; check "
