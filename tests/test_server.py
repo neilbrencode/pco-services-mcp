@@ -26,7 +26,7 @@ async def call(name: str, args: dict | None = None):
     return (True, text) if result.is_error else (False, json.loads(text))
 
 
-def schedule(sid: str, when: str, plan: str = "300") -> dict:
+def schedule(sid: str, when: str, plan: str = "300", status: str = "C") -> dict:
     """A schedule entry; `when` is local wall-clock time with a "Z", as Planning Center sends it."""
     return {
         "type": "Schedule",
@@ -37,7 +37,7 @@ def schedule(sid: str, when: str, plan: str = "300") -> dict:
             "service_type_name": "Sunday",
             "team_name": "Band",
             "team_position_name": "Keys",
-            "status": "C",
+            "status": status,
         },
         "relationships": {
             "service_type": {"data": {"type": "ServiceType", "id": "20"}},
@@ -178,7 +178,7 @@ async def test_my_schedule_finds_the_next_service_after_many_pages_of_history(fa
             )
             for n in range(1, 7)
         ]
-        + [jsonapi([schedule("next", "2099-02-01T09:00:00Z")])]
+        + [jsonapi([schedule("999", "2099-02-01T09:00:00Z")])]
     )
     fake.route("GET", f"/services/v2/people/{ME}/schedules", lambda r: next(pages))
     _, out = await call("my_schedule")
@@ -630,6 +630,185 @@ async def test_errors_reach_the_client_with_their_text(fake):
     assert is_error and "token revoked" in text and "pco-services-mcp login" in text
 
 
+SCHEDULES = f"/services/v2/people/{ME}/schedules"
+
+
+def answerable(fake, status: str, sid: str = "7", declined_times: int = 0) -> dict:
+    """A request Planning Center reads back directly; accept/decline change its status.
+
+    declined_times > 0 is a split-time request with that many of its times declined.
+    """
+    held = {"status": status, "declined": declined_times}
+
+    def answer(new: str):
+        def handler(_request):
+            held["status"] = new
+            held["declined"] = 0
+            return httpx.Response(204)
+
+        return handler
+
+    fake.route(
+        "GET",
+        f"{SCHEDULES}/{sid}",
+        lambda r: jsonapi(schedule(sid, "2099-01-01T09:00:00Z", status=held["status"])),
+    )
+    fake.route(
+        "GET",
+        f"{SCHEDULES}/{sid}/declined_plan_times",
+        lambda r: jsonapi([{"type": "PlanTime", "id": "40"}] * held["declined"]),
+    )
+    fake.route("POST", f"{SCHEDULES}/{sid}/accept", answer("C"))
+    fake.route("POST", f"{SCHEDULES}/{sid}/decline", answer("D"))
+    return held
+
+
+async def test_my_schedule_gives_schedule_ids_and_can_include_declined(fake):
+    fake.route("GET", SCHEDULES, jsonapi([schedule("5", "2099-01-01T09:00:00Z", status="D")]))
+    _, out = await call("my_schedule")
+    assert out["schedules"][0]["schedule_id"] == "5"
+    await call("contact_info", {"name": "Example"})
+    assert all("filter" not in r.url.params for r in fake.requests if r.url.path == SCHEDULES)
+    _, out = await call("my_schedule", {"include_declined": True})
+    last = [r for r in fake.requests if r.url.path == SCHEDULES][-1]
+    assert last.url.params["filter"] == "with_declined"
+    assert out["schedules"][0]["status"] == "declined"
+
+
+@pytest.mark.parametrize("status", ["U", "D"])
+async def test_accept_request_answers_or_changes_my_answer(fake, status):
+    answerable(fake, status)
+    is_error, out = await call("accept_request", {"schedule_id": "7"})
+    assert not is_error, out
+    assert fake.paths("POST") == [f"{SCHEDULES}/7/accept"]
+    assert fake.bodies("POST", f"{SCHEDULES}/7/accept") == [{}]
+    assert out["status"] == "confirmed" and out["verified"] is True
+
+
+@pytest.mark.parametrize(("status", "reason"), [("U", "Away that week"), ("C", None)])
+async def test_decline_request_sends_only_the_reason(fake, status, reason):
+    answerable(fake, status)
+    args = {"schedule_id": "7"} | ({"reason": reason} if reason else {})
+    _, out = await call("decline_request", args)
+    # Exactly this body: no replacement_id or replacement_confirmed, which would make
+    # Planning Center contact someone else.
+    assert fake.bodies("POST", f"{SCHEDULES}/7/decline") == [
+        {
+            "data": {
+                "type": "ScheduleDecline",
+                "attributes": {"reason": reason or ""},
+                "relationships": None,
+            }
+        }
+    ]
+    assert out["status"] == "declined" and out["verified"] is True
+
+
+@pytest.mark.parametrize(("tool", "status"), [("accept_request", "C"), ("decline_request", "D")])
+async def test_an_answer_already_given_is_not_sent_again(fake, tool, status):
+    answerable(fake, status)
+    _, out = await call(tool, {"schedule_id": "7"})
+    assert out["unchanged"] is True
+    assert fake.paths("POST") == []
+
+
+async def test_accept_request_accepts_the_declined_times_of_a_confirmed_request(fake):
+    answerable(fake, "C", declined_times=1)
+    _, out = await call("accept_request", {"schedule_id": "7"})
+    assert fake.paths("POST") == [f"{SCHEDULES}/7/accept"]
+    assert out["verified"] is True and "unchanged" not in out
+
+
+async def test_an_accept_that_leaves_times_declined_is_not_verified(fake):
+    answerable(fake, "C", declined_times=1)
+    # Planning Center takes the accept but keeps the time declined.
+    fake.route("POST", f"{SCHEDULES}/7/accept", httpx.Response(204))
+    _, out = await call("accept_request", {"schedule_id": "7"})
+    assert out["verified"] is False and "times still show as declined" in out["note"]
+
+
+@pytest.mark.parametrize("tool", ["accept_request", "decline_request"])
+async def test_answering_refuses_a_bad_id_before_any_request(fake, tool):
+    is_error, text = await call(tool, {"schedule_id": "7/../8"})
+    assert is_error and "numeric" in text
+    assert fake.requests == []
+
+
+async def test_answering_refuses_a_request_not_on_my_schedule(fake):
+    fake.route("GET", f"{SCHEDULES}/7", error(404))
+    fake.route("GET", SCHEDULES, jsonapi([schedule("8", "2099-01-01T09:00:00Z")]))
+    is_error, text = await call("decline_request", {"schedule_id": "7"})
+    assert is_error and "isn't on your schedule" in text
+    assert fake.paths("POST") == []
+
+
+async def test_a_declined_request_is_found_on_a_later_page(fake):
+    held = {"status": "D"}
+    more = f"https://api.planningcenteronline.com{SCHEDULES}?filter=with_declined&offset=1"
+
+    def listing(r):
+        assert r.url.params["filter"] == "with_declined"
+        if "offset" in r.url.params:
+            return jsonapi([schedule("7", "2099-01-01T09:00:00Z", status=held["status"])])
+        return jsonapi([schedule("8", "2099-01-01T09:00:00Z")], next_url=more)
+
+    def accept(_request):
+        held["status"] = "C"
+        return httpx.Response(204)
+
+    fake.route("GET", f"{SCHEDULES}/7", error(404))
+    fake.route("GET", f"{SCHEDULES}/7/declined_plan_times", jsonapi([]))
+    fake.route("GET", SCHEDULES, listing)
+    fake.route("POST", f"{SCHEDULES}/7/accept", accept)
+    _, out = await call("accept_request", {"schedule_id": "7"})
+    assert out["status"] == "confirmed" and out["verified"] is True
+
+
+async def test_an_unfinished_search_for_the_request_refuses_without_writing(fake):
+    more = f"https://api.planningcenteronline.com{SCHEDULES}?offset=1"
+    fake.route("GET", f"{SCHEDULES}/7", error(404))
+    fake.route("GET", SCHEDULES, jsonapi([schedule("8", "2099-01-01T09:00:00Z")], next_url=more))
+    is_error, text = await call("accept_request", {"schedule_id": "7"})
+    assert is_error and "too long to search" in text
+    assert fake.paths("POST") == []
+
+
+@pytest.mark.parametrize(
+    ("reread", "status", "note"),
+    [
+        (error(404), None, "no longer appears"),
+        (error(500), None, "returned 500"),
+        (jsonapi(schedule("7", "2099-01-01T09:00:00Z", status="U")), "unconfirmed", "still shows"),
+    ],
+)
+async def test_a_sent_answer_that_cannot_be_read_back_is_reported_not_raised(
+    fake, reread, status, note
+):
+    reads = iter([jsonapi(schedule("7", "2099-01-01T09:00:00Z", status="U")), reread])
+    fake.route("GET", f"{SCHEDULES}/7", lambda r: next(reads))
+    fake.route("GET", SCHEDULES, jsonapi([]))
+    fake.route("POST", f"{SCHEDULES}/7/decline", httpx.Response(204))
+    is_error, out = await call("decline_request", {"schedule_id": "7"})
+    assert not is_error, out
+    assert out["verified"] is False and out["status"] == status
+    assert note in out["note"] and out["dates"] == "2099-01-01"
+    assert len(fake.paths("POST")) == 1
+
+
+def unreachable(request):
+    raise httpx.ConnectError("synthetic", request=request)
+
+
+@pytest.mark.parametrize(
+    ("reply", "uncertain"), [(unreachable, True), (error(502), True), (error(403), False)]
+)
+async def test_a_lost_answer_says_it_may_have_gone_through(fake, reply, uncertain):
+    answerable(fake, "U")
+    fake.route("POST", f"{SCHEDULES}/7/accept", reply)
+    is_error, text = await call("accept_request", {"schedule_id": "7"})
+    assert is_error and ("may or may not have reached" in text) is uncertain
+
+
 def blockout(bid: str, starts: str, ends: str, **attrs) -> dict:
     return {
         "type": "Blockout",
@@ -764,5 +943,8 @@ async def test_write_tools_are_annotated():
         tools["remove_blockout"].destructive_hint and tools["skip_blockout_date"].destructive_hint
     )
     assert tools["add_blockout"].read_only_hint is False
+    assert tools["decline_request"].destructive_hint and tools["decline_request"].idempotent_hint
+    accept = tools["accept_request"]
+    assert accept.read_only_hint is False and accept.destructive_hint is False
     for name in ("my_schedule", "plan_team", "service_order", "list_attachments", "list_blockouts"):
         assert tools[name].read_only_hint
