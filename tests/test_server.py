@@ -633,13 +633,17 @@ async def test_errors_reach_the_client_with_their_text(fake):
 SCHEDULES = f"/services/v2/people/{ME}/schedules"
 
 
-def answerable(fake, status: str, sid: str = "7") -> dict:
-    """A request Planning Center reads back directly; accept/decline change its status."""
-    held = {"status": status}
+def answerable(fake, status: str, sid: str = "7", declined_times: int = 0) -> dict:
+    """A request Planning Center reads back directly; accept/decline change its status.
+
+    declined_times > 0 is a split-time request with that many of its times declined.
+    """
+    held = {"status": status, "declined": declined_times}
 
     def answer(new: str):
         def handler(_request):
             held["status"] = new
+            held["declined"] = 0
             return httpx.Response(204)
 
         return handler
@@ -648,6 +652,11 @@ def answerable(fake, status: str, sid: str = "7") -> dict:
         "GET",
         f"{SCHEDULES}/{sid}",
         lambda r: jsonapi(schedule(sid, "2099-01-01T09:00:00Z", status=held["status"])),
+    )
+    fake.route(
+        "GET",
+        f"{SCHEDULES}/{sid}/declined_plan_times",
+        lambda r: jsonapi([{"type": "PlanTime", "id": "40"}] * held["declined"]),
     )
     fake.route("POST", f"{SCHEDULES}/{sid}/accept", answer("C"))
     fake.route("POST", f"{SCHEDULES}/{sid}/decline", answer("D"))
@@ -703,6 +712,21 @@ async def test_an_answer_already_given_is_not_sent_again(fake, tool, status):
     assert fake.paths("POST") == []
 
 
+async def test_accept_request_accepts_the_declined_times_of_a_confirmed_request(fake):
+    answerable(fake, "C", declined_times=1)
+    _, out = await call("accept_request", {"schedule_id": "7"})
+    assert fake.paths("POST") == [f"{SCHEDULES}/7/accept"]
+    assert out["verified"] is True and "unchanged" not in out
+
+
+async def test_an_accept_that_leaves_times_declined_is_not_verified(fake):
+    answerable(fake, "C", declined_times=1)
+    # Planning Center takes the accept but keeps the time declined.
+    fake.route("POST", f"{SCHEDULES}/7/accept", httpx.Response(204))
+    _, out = await call("accept_request", {"schedule_id": "7"})
+    assert out["verified"] is False and "times still show as declined" in out["note"]
+
+
 @pytest.mark.parametrize("tool", ["accept_request", "decline_request"])
 async def test_answering_refuses_a_bad_id_before_any_request(fake, tool):
     is_error, text = await call(tool, {"schedule_id": "7/../8"})
@@ -733,6 +757,7 @@ async def test_a_declined_request_is_found_on_a_later_page(fake):
         return httpx.Response(204)
 
     fake.route("GET", f"{SCHEDULES}/7", error(404))
+    fake.route("GET", f"{SCHEDULES}/7/declined_plan_times", jsonapi([]))
     fake.route("GET", SCHEDULES, listing)
     fake.route("POST", f"{SCHEDULES}/7/accept", accept)
     _, out = await call("accept_request", {"schedule_id": "7"})

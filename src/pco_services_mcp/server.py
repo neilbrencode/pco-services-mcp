@@ -286,6 +286,18 @@ async def _find_request(base: str, sid: str) -> dict | None:
     return None
 
 
+async def _answered(base: str, sched: dict, action: str) -> bool:
+    """Whether the request already has the answer `action` gives, for every time on it."""
+    if sched["attributes"].get("status") != _ANSWERS[action]:
+        return False
+    if action == "decline":
+        return True
+    # A split-time request shows as confirmed while some of its times are still declined.
+    sid = check_id(sched["id"], "schedule id")
+    declined = await state.api().get(f"{base}/{sid}/declined_plan_times")
+    return not declined.get("data")
+
+
 async def _answer(schedule_id: str, action: str, body: dict) -> dict:
     """POST `action` to one of your Schedules, then read back the status it now has."""
     sid = check_id(schedule_id, "schedule_id")
@@ -295,8 +307,7 @@ async def _answer(schedule_id: str, action: str, body: dict) -> dict:
     before = await _find_request(base, sid)
     if before is None:
         raise PcoError("That request isn't on your schedule.")
-    wanted = _ANSWERS[action]
-    if before["attributes"].get("status") == wanted:
+    if await _answered(base, before, action):
         return {**_request(before), "unchanged": True}
     try:
         await api.request("POST", f"{base}/{sid}/{action}", json=body)
@@ -311,14 +322,19 @@ async def _answer(schedule_id: str, action: str, body: dict) -> dict:
     # The POST succeeded, so from here on report rather than raise: a retry is the harm.
     try:
         after = await _find_request(base, sid)
+        done = after is not None and await _answered(base, after, action)
     except PcoError as exc:
-        after, problem = None, str(exc)
+        after, done, problem = None, False, str(exc)
     else:
         problem = "it no longer appears on your schedule"
-    if after is not None:
-        if after["attributes"].get("status") == wanted:
-            return {**_request(after), "verified": True}
-        problem = f"it still shows as {_request(after)['status']}"
+    if done:
+        return {**_request(after), "verified": True}
+    elif after is not None:
+        problem = (
+            "some of its times still show as declined"
+            if after["attributes"].get("status") == _ANSWERS[action]
+            else f"it still shows as {_request(after)['status']}"
+        )
     return {
         **_request(before),
         "status": None if after is None else _request(after)["status"],
